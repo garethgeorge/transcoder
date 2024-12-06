@@ -185,9 +185,11 @@ func loadLog(filename string) ([]logFileEntry, error) {
 }
 
 func appendLog(filename string, entry logFileEntry) error {
-	logMu.Lock()
-	defer logMu.Unlock()
-
+	lock := flock.New(filename + ".lock")
+	if err := lock.Lock(); err != nil {
+		return err
+	}
+	defer lock.Unlock()
 	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
