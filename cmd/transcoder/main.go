@@ -118,7 +118,7 @@ func transcodeMatch(infile, outfile string) {
 		"-c:v", "libx265",
 		"-crf", "28",
 		"-preset", "fast",
-		"-c:a", "aac",
+		"-c:a", "libopus",
 		"-b:a", "128k",
 		"-y",
 		outfile + ".transcode.mkv",
