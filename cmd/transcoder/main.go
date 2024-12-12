@@ -2,9 +2,8 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -46,6 +45,8 @@ func main() {
 		fmt.Printf("Usage: %s <input directory> <out directory>\n", os.Args[0])
 		return
 	}
+
+	fmt.Printf("Temp directory: %s\n", tempdir)
 
 	inDir := flag.Arg(0)
 	outDir := flag.Arg(1)
@@ -90,17 +91,16 @@ func transcodeMatch(infile, outfile string) {
 		return
 	}
 
-	namehash := sha1.Sum([]byte(outfile))
-	lockfile := filepath.Join(tempdir, hex.EncodeToString(namehash[0:1])+".lock") // use first byte of hash as lockfile name -- 256 possible lockfiles
-	lock := flock.New(lockfile)
-	if ok, err := lock.TryLock(); err != nil {
-		fmt.Printf("Item %q lock error: %v\n", infile, err)
-		return
-	} else if !ok {
-		fmt.Printf("Item %q already transcoding by another process\n", infile)
+	namedLockSet := &NamedLockSet{File: os.TempDir() + "/gtranscoder.lockset"}
+	if err := namedLockSet.TryAcquire(infile); err != nil {
+		if errors.Is(err, ErrLockAlreadyHeld) {
+			fmt.Printf("Item %q already transcoding by another proces: %v\n", infile, err)
+			return
+		}
+		fmt.Printf("Item %q failed to acquire lock unknown error: %v\n", infile, err)
 		return
 	}
-	defer lock.Unlock()
+	defer namedLockSet.Release(infile)
 
 	if _, err := os.Stat(outfile); err == nil {
 		fmt.Printf("Item %q already transcoded\n", infile)
@@ -112,16 +112,10 @@ func transcodeMatch(infile, outfile string) {
 		return
 	}
 
-	args := []string{
-		"ffmpeg",
-		"-i", infile,
-		"-c:v", "libx265",
-		"-crf", "28",
-		"-preset", "fast",
-		"-c:a", "libopus",
-		"-b:a", "128k",
-		"-y",
-		outfile + ".transcode.mkv",
+	args, err := createFfmpegCommand(infile, outfile+".transcode.mkv")
+	if err != nil {
+		fmt.Printf("Item %q error forming ffmpeg command: %v\n", infile, err)
+		return
 	}
 
 	cmd := exec.Command(args[0], args[1:]...)
@@ -140,11 +134,20 @@ func transcodeMatch(infile, outfile string) {
 		fmt.Printf("Item %q error: %v\n", infile, err)
 		baseLog.Error = err.Error()
 		baseLog.Duration = time.Since(time.Now()).String()
-		appendLog(*logFile, baseLog)
+		if err := appendLog(*logFile, baseLog); err != nil {
+			fmt.Printf("Log write error %q: %v\n", infile, err)
+		}
+
+		if err := os.Remove(outfile + ".transcode.mkv"); err != nil {
+			fmt.Printf("Item %q failure cleanup error: %v\n", infile, err)
+		}
+		return
 	} else {
 		fmt.Printf("Item %q transcoded\n", infile)
 		baseLog.Duration = time.Since(time.Now()).String()
-		appendLog(*logFile, baseLog)
+		if err := appendLog(*logFile, baseLog); err != nil {
+			fmt.Printf("Log write error %q: %v\n", infile, err)
+		}
 	}
 
 	if err := os.Rename(outfile+".transcode.mkv", outfile); err != nil {
@@ -200,4 +203,88 @@ func appendLog(filename string, entry logFileEntry) error {
 		return err
 	}
 	return nil
+}
+
+func createFfmpegCommand(videoFileName string, outputFileName string) ([]string, error) {
+	// Get file metadata using ffprobe
+	probeCmd := exec.Command("ffprobe",
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_format",
+		"-show_streams",
+		videoFileName,
+	)
+	probeOutput, err := probeCmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("ffprobe failed: %w", err)
+	}
+
+	var probeData struct {
+		Streams []struct {
+			CodecType string `json:"codec_type"`
+			Channels  int    `json:"channels"`
+			// HDR metadata fields
+			ColorSpace     string `json:"color_space"`
+			ColorTransfer  string `json:"color_transfer"`
+			ColorPrimaries string `json:"color_primaries"`
+		} `json:"streams"`
+	}
+
+	if err := json.Unmarshal(probeOutput, &probeData); err != nil {
+		return nil, fmt.Errorf("failed to parse ffprobe output: %w", err)
+	}
+
+	args := []string{
+		"ffmpeg",
+		"-i", videoFileName,
+		"-c:v", "libx265",
+		"-crf", "28",
+		"-preset", "fast",
+	}
+
+	// Handle HDR settings
+	for _, stream := range probeData.Streams {
+		if stream.CodecType == "video" {
+			if stream.ColorSpace == "bt2020nc" && (stream.ColorTransfer == "arib-std-b67" || stream.ColorTransfer == "smpte2084") {
+				// PQ content detected
+				args = append(args,
+					"-colorspace", "bt2020nc",
+					"-color_primaries", "bt2020",
+					"-color_trc", "smpte2084",
+					"-x265-params", "hdr-opt=1:repeat-headers=1",
+				)
+			}
+		}
+	}
+
+	// Handle audio settings
+	hasAudio := false
+	for _, stream := range probeData.Streams {
+		if stream.CodecType == "audio" {
+			hasAudio = true
+			if stream.Channels > 2 {
+				// Downmix to stereo
+				args = append(args,
+					"-ac", "2",
+					"-c:a", "libopus",
+					"-b:a", "128k",
+				)
+			} else {
+				// Keep original channel count
+				args = append(args,
+					"-c:a", "libopus",
+					"-b:a", "128k",
+				)
+			}
+			break
+		}
+	}
+
+	if !hasAudio {
+		// Copy video only if no audio streams found
+		args = append(args, "-an")
+	}
+
+	args = append(args, "-y", outputFileName)
+	return args, nil
 }
