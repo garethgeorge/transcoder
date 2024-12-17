@@ -36,8 +36,6 @@ var (
 	}
 	logMu sync.Mutex
 
-	tempdir = filepath.Join(os.TempDir(), "go-transcoder")
-
 	presets = []string{"h265", "h264", "h264_low"}
 )
 
@@ -58,7 +56,6 @@ func main() {
 	}
 
 	fmt.Printf("Using preset %q\n", flag.Arg(0))
-	fmt.Printf("Temp directory: %s\n", tempdir)
 
 	preset := flag.Arg(0)
 	inDir := flag.Arg(1)
@@ -66,11 +63,6 @@ func main() {
 
 	fmt.Printf("Input directory: %s\n", inDir)
 	fmt.Printf("Output directory: %s\n", outDir)
-
-	if err := os.MkdirAll(tempdir, 0755); err != nil {
-		fmt.Printf("Error creating temp directory: %v\n", err)
-		return
-	}
 
 	var matches []string
 	filepath.Walk(inDir, func(path string, info os.FileInfo, err error) error {
