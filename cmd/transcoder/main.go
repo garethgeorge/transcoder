@@ -17,7 +17,8 @@ import (
 )
 
 var (
-	logFile = flag.String("log", "transcodelog.ndjson", "Log file")
+	logFile       = flag.String("log", "transcodelog.ndjson", "Log file")
+	surroundSound = flag.Bool("surround", false, "Use surround sound if possible")
 
 	videoFileExts []string = []string{
 		".mp4",
@@ -37,7 +38,7 @@ var (
 
 	tempdir = filepath.Join(os.TempDir(), "go-transcoder")
 
-	presets = []string{"h265", "h264"}
+	presets = []string{"h265", "h264", "h264_low"}
 )
 
 func main() {
@@ -240,6 +241,8 @@ func createFfmpegCommand(preset string, videoFileName string, outputFileName str
 		args = append(args, "-c:v", "libx265", "-crf", "28", "-preset", "fast")
 	case "h264":
 		args = append(args, "-c:v", "libx264", "-crf", "24", "-preset", "fast")
+	case "h264_low":
+		args = append(args, "-c:v", "libx264", "-crf", "28", "-preset", "fast")
 	default:
 		panic("unknown preset: " + preset)
 	}
@@ -254,7 +257,7 @@ func createFfmpegCommand(preset string, videoFileName string, outputFileName str
 				"-color_trc", "smpte2084",
 				"-x265-params", "hdr-opt=1:repeat-headers=1",
 			)
-		case "h264":
+		case "h264", "h264_low":
 			args = append(args,
 				"-colorspace", "bt2020nc",
 				"-color_primaries", "bt2020",
@@ -272,14 +275,21 @@ func createFfmpegCommand(preset string, videoFileName string, outputFileName str
 	for _, stream := range probeData.Streams {
 		if stream.CodecType == "audio" {
 			if stream.Channels > 2 {
-				// Downmix to stereo for all audio streams
-				args = append(args,
-					"-c:a", "libopus",
-					"-ac", "2",
-					"-b:a", "128k",
-				)
+				if *surroundSound {
+					// Keep original audio format for all audio streams
+					args = append(args,
+						"-c:a", "copy",
+					)
+				} else {
+					// Downmix to stereo for all audio streams
+					args = append(args,
+						"-c:a", "libopus",
+						"-ac", "2",
+						"-b:a", "128k",
+					)
+				}
 			} else {
-				// Keep original channel count for all audio streams
+				// Convert all audio streams to opus
 				args = append(args,
 					"-c:a", "libopus",
 					"-b:a", "128k",
