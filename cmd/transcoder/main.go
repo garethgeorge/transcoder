@@ -127,6 +127,8 @@ func transcodeMatch(preset, infile, outfile string) {
 		return
 	}
 
+	fmt.Printf("Item %q command: %s\n", infile, strings.Join(args, " "))
+
 	startTime := time.Now()
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdout = os.Stdout
@@ -200,6 +202,9 @@ type probeData struct {
 		ColorSpace     string `json:"color_space"`
 		ColorTransfer  string `json:"color_transfer"`
 		ColorPrimaries string `json:"color_primaries"`
+		// Size
+		Width  int `json:"width"`
+		Height int `json:"height"`
 	} `json:"streams"`
 }
 
@@ -266,16 +271,30 @@ func createFfmpegCommand(preset string, videoFileName string, outputFileName str
 	case "svtav1":
 		// SVT-AV1 presets documented here: https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/CommonQuestions.md#what-presets-do
 		// Good graphs for choosing presets: https://ottverse.com/analysis-of-svt-av1-presets-and-crf-values/
-		args = append(args, "-c:v", "libsvtav1", "-crf", "26", "-preset", "6")
+		args = append(args, "-c:v", "libsvtav1", "-crf", "22", "-preset", "6")
 	case "svtav1_fast":
-		// This encoder uses preset=10 which is ffmpeg's default preset. It produces decent results at crf=24
+		// This encoder uses preset=8 which is ffmpeg's default preset. It produces decent results at crf=24
 		// and is very fast to encode as it's intended for streaming use cases.
 		// When time is of less concern, however, presets 4-6 e.g. in the default "svtav1" profile are preferred.
 		// SVT-AV1 presets documented here: https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/CommonQuestions.md#what-presets-do
-		args = append(args, "-c:v", "libsvtav1", "-crf", "26", "-preset", "8")
+		args = append(args, "-c:v", "libsvtav1", "-crf", "22", "-preset", "8")
 	default:
 		panic("unknown preset: " + preset)
 	}
+
+	targetRate1080p := 2000 // 2 MBps 1080p SVTAV1
+	videoWidth, videoHeight := getResolution(probeData)
+	resolutionRatio := float64(videoWidth*videoHeight) / float64(1920*1080)
+	fmt.Printf("Resolution ratio: %f\n", resolutionRatio)
+	if resolutionRatio < 0.5 {
+		resolutionRatio = 0.5
+	}
+
+	targetRate := int(float64(targetRate1080p) * resolutionRatio)
+	args = append(args,
+		"-minrate", fmt.Sprintf("%dk", targetRate),
+		"-bufsize", fmt.Sprintf("%dk", targetRate),
+	)
 
 	// Handle HDR settings
 	if isHDR(probeData) {
@@ -343,4 +362,21 @@ func isHDR(probeData probeData) bool {
 		}
 	}
 	return false
+}
+
+func getResolution(probeData probeData) (int, int) {
+	videoIdx := videoStreamIndex(probeData)
+	if videoIdx == -1 {
+		return 0, 0
+	}
+	return probeData.Streams[videoIdx].Width, probeData.Streams[videoIdx].Height
+}
+
+func videoStreamIndex(probeData probeData) int {
+	for i, stream := range probeData.Streams {
+		if stream.CodecType == "video" {
+			return i
+		}
+	}
+	return -1
 }
