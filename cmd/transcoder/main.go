@@ -290,10 +290,10 @@ func createFfmpegCommand(preset string, videoFileName string, outputFileName str
 		resolutionRatio = 0.5
 	}
 
-	targetRate := int(float64(targetRate1080p) * resolutionRatio)
+	targetMinRate := int(float64(targetRate1080p) * resolutionRatio)
 	args = append(args,
-		"-minrate", fmt.Sprintf("%dk", targetRate),
-		"-bufsize", fmt.Sprintf("%dk", targetRate),
+		"-minrate", fmt.Sprintf("%dk", targetMinRate),
+		"-bufsize", fmt.Sprintf("%dk", targetMinRate),
 	)
 
 	// Handle HDR settings
