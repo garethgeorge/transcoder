@@ -19,6 +19,7 @@ import (
 var (
 	logFile       = flag.String("log", "transcodelog.ndjson", "Log file")
 	surroundSound = flag.Bool("surround", false, "Use surround sound if possible")
+	dockerImage   = flag.String("docker-image", "", "Docker image to use for ffmpeg")
 
 	videoFileExts []string = []string{
 		".mp4",
@@ -36,7 +37,7 @@ var (
 	}
 	logMu sync.Mutex
 
-	presets = []string{"h265", "h264", "h264_low"}
+	presets = []string{"h265", "h264", "h264_low", "svtav1", "svtav1_fast"}
 )
 
 func main() {
@@ -55,6 +56,7 @@ func main() {
 		return
 	}
 
+	fmt.Printf("Using docker image %q\n", *dockerImage)
 	fmt.Printf("Using preset %q\n", flag.Arg(0))
 
 	preset := flag.Arg(0)
@@ -222,11 +224,37 @@ func createFfmpegCommand(preset string, videoFileName string, outputFileName str
 
 	args := []string{
 		"ffmpeg",
+	}
+
+	if *dockerImage != "" {
+		// touch output file path
+		if err := os.MkdirAll(filepath.Dir(outputFileName), 0755); err != nil {
+			return nil, fmt.Errorf("failed to create output directory: %w", err)
+		}
+		if err := os.WriteFile(outputFileName, []byte{}, 0644); err != nil {
+			return nil, fmt.Errorf("failed to create output file: %w", err)
+		}
+
+		newVideoFileName := "/input" + filepath.Ext(videoFileName)
+		newOutputFileName := "/output" + filepath.Ext(outputFileName)
+
+		args = append([]string{
+			"docker", "run", "--rm",
+			"-v", videoFileName + ":" + newVideoFileName,
+			"-v", outputFileName + ":" + newOutputFileName,
+			*dockerImage,
+		}, args...)
+
+		videoFileName = newVideoFileName
+		outputFileName = newOutputFileName
+	}
+
+	args = append(args,
 		"-i", videoFileName,
 		"-map", "0:v:0", // Map first video stream
 		"-map", "0:a", // Map all audio streams
 		"-c:s", "copy", // Copy all subtitle streams
-	}
+	)
 
 	switch preset {
 	case "h265":
@@ -235,6 +263,16 @@ func createFfmpegCommand(preset string, videoFileName string, outputFileName str
 		args = append(args, "-c:v", "libx264", "-crf", "24", "-preset", "fast")
 	case "h264_low":
 		args = append(args, "-c:v", "libx264", "-crf", "28", "-preset", "fast")
+	case "svtav1":
+		// SVT-AV1 presets documented here: https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/CommonQuestions.md#what-presets-do
+		// Good graphs for choosing presets: https://ottverse.com/analysis-of-svt-av1-presets-and-crf-values/
+		args = append(args, "-c:v", "libsvtav1", "-crf", "26", "-preset", "6")
+	case "svtav1_fast":
+		// This encoder uses preset=10 which is ffmpeg's default preset. It produces decent results at crf=24
+		// and is very fast to encode as it's intended for streaming use cases.
+		// When time is of less concern, however, presets 4-6 e.g. in the default "svtav1" profile are preferred.
+		// SVT-AV1 presets documented here: https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/CommonQuestions.md#what-presets-do
+		args = append(args, "-c:v", "libsvtav1", "-crf", "26", "-preset", "8")
 	default:
 		panic("unknown preset: " + preset)
 	}
@@ -249,7 +287,7 @@ func createFfmpegCommand(preset string, videoFileName string, outputFileName str
 				"-color_trc", "smpte2084",
 				"-x265-params", "hdr-opt=1:repeat-headers=1",
 			)
-		case "h264", "h264_low":
+		case "h264", "h264_low", "svtav1", "svtav1_fast":
 			args = append(args,
 				"-colorspace", "bt2020nc",
 				"-color_primaries", "bt2020",
@@ -259,7 +297,7 @@ func createFfmpegCommand(preset string, videoFileName string, outputFileName str
 			panic("unknown preset: " + preset)
 		}
 	} else {
-		// Let's convert to a 10 bit color space
+		// Let's convert to a 10 bit color space, compatible with all encoders
 		args = append(args, "-pix_fmt", "yuv420p10le")
 	}
 
@@ -299,6 +337,7 @@ func isHDR(probeData probeData) bool {
 	for _, stream := range probeData.Streams {
 		if stream.CodecType == "video" {
 			if stream.ColorSpace == "bt2020nc" && (stream.ColorTransfer == "arib-std-b67" || stream.ColorTransfer == "smpte2084") {
+				fmt.Println("Detected HDR content")
 				return true
 			}
 		}
