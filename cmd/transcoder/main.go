@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,11 +12,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gofrs/flock"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 var (
-	logFile       = flag.String("log", "transcodelog.ndjson", "Log file")
+	errSkip = errors.New("skip")
+)
+
+var (
+	logFile       = flag.String("log", "", "Log file, defaults to ~/.local/share/gtranscoder/transcode.log")
 	surroundSound = flag.Bool("surround", false, "Use surround sound if possible")
 	dockerImage   = flag.String("docker-image", "", "Docker image to use for ffmpeg")
 
@@ -63,8 +67,15 @@ func main() {
 	inDir := flag.Arg(1)
 	outDir := flag.Arg(2)
 
-	fmt.Printf("Input directory: %s\n", inDir)
-	fmt.Printf("Output directory: %s\n", outDir)
+	zap.S().Infof("Input directory: %s\n", inDir)
+	zap.S().Infof("Output directory: %s\n", outDir)
+
+	if *logFile == "" {
+		*logFile = filepath.Join(os.Getenv("HOME"), ".local", "share", "gtranscoder", "transcode.log")
+	}
+	if err := os.MkdirAll(filepath.Dir(*logFile), 0755); err != nil {
+		zap.S().Fatalf("Error creating log directory: %v", err)
+	}
 
 	var matches []string
 	filepath.Walk(inDir, func(path string, info os.FileInfo, err error) error {
@@ -81,20 +92,117 @@ func main() {
 
 	slices.Sort(matches)
 
-	fmt.Printf("Found %d video files\n", len(matches))
+	zap.S().Infof("Found %d video files\n", len(matches))
+
+	// refresh the transcode log every minute from disk. This should do a reasonably good job of catching new entries.
+	var transcodeLogMu sync.Mutex
+	type tlogDictKey struct {
+		InputPath  string
+		OutputPath string
+	}
+	transcodeLogDict := make(map[tlogDictKey]logFileEntry)
+
+	go func() {
+		for {
+			time.Sleep(300 * time.Second)
+			transcodeLogMu.Lock()
+			updated, err := readLog(*logFile)
+			if err != nil {
+				zap.S().Warnf("Error reading transcode log: %v", err)
+				continue
+			}
+			for _, entry := range updated {
+				key := tlogDictKey{
+					InputPath:  entry.InputPath,
+					OutputPath: entry.OutputPath,
+				}
+				transcodeLogDict[key] = entry
+			}
+			transcodeLogMu.Unlock()
+		}
+	}()
 
 	for _, match := range matches {
 		relativePath := strings.TrimPrefix(match, inDir)
 		outfile := filepath.Join(outDir, relativePath)
 		outfile = strings.TrimSuffix(outfile, filepath.Ext(outfile)) + ".mkv"
-		transcodeMatch(preset, match, outfile)
+
+		// resolve absolute paths
+		match, err := filepath.Abs(match)
+		if err != nil {
+			fmt.Printf("Error resolving absolute path: %v\n", err)
+			return
+		}
+		outfile, err = filepath.Abs(outfile)
+		if err != nil {
+			fmt.Printf("Error resolving absolute path: %v\n", err)
+			return
+		}
+
+		// skip previously transcoded files
+		found, ok := transcodeLogDict[tlogDictKey{
+			InputPath:  match,
+			OutputPath: outfile,
+		}]
+		if ok {
+			if found.Error != "" {
+				zap.S().Infof("Item %q was previously attempted but failed, skipping: %s\n", match, found.Error)
+				continue
+			}
+			if found.Skipped != "" {
+				zap.S().Infof("Item %q was previously skipped: %s\n", match, found.Skipped)
+				continue
+			}
+			if found.Duration != "" {
+				zap.S().Infof("Item %q was previously transcoded: took %s\n", match, found.Duration)
+				continue
+			}
+			zap.S().Infof("Item %q was previously transcoded, skipping\n", match)
+			continue
+		}
+
+		// examine whether we should encode the file or not
+		ffprobeData, err := getFfprobeInfo(match)
+		if err != nil {
+			zap.S().Errorf("Item %q ffprobe error: %v\n", match, err)
+			continue
+		}
+		if ffprobeData.GetBitrateBPS() < 2000000 {
+			zap.S().Infof("Item %q is already low bitrate (%d bps), skipping\n", match, ffprobeData.GetBitrateBPS())
+			continue
+		}
+
+		zap.S().Infof("Item %q is high bitrate (%d bps), encoding it to AV1\n", match, ffprobeData.GetBitrateBPS())
+		transcodeMatch(preset, ffprobeData, match, outfile)
 	}
 
-	fmt.Println("All items processed")
+	zap.S().Infof("All items processed")
 }
 
-func transcodeMatch(preset, infile, outfile string) {
+func init() {
+	// Create a colored zap console logger
+	consoleConfig := zap.NewDevelopmentConfig()
+	consoleConfig.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	consoleLogger, _ := consoleConfig.Build()
+	zap.ReplaceGlobals(consoleLogger)
+}
+
+func transcodeMatch(preset string, probeData probeData, infile, outfile string) {
 	fmt.Printf("Checking item %q -> %q\n", infile, outfile)
+
+	// Check the whole transcode log ... this is a bit expensive but should be absolutely dwarfed by encoding times.
+	entries, err := readLog(*logFile)
+	if err != nil {
+		zap.S().Warnf("Error reading log: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.InputPath == infile && entry.OutputPath == outfile {
+			fmt.Printf("Item %q already transcoded\n", infile)
+			return
+		}
+	}
+
+	// Check if the output file already exists
 	if _, err := os.Stat(outfile); err == nil {
 		fmt.Printf("Item %q already transcoded\n", infile)
 		return
@@ -121,13 +229,16 @@ func transcodeMatch(preset, infile, outfile string) {
 		return
 	}
 
-	args, err := createFfmpegCommand(preset, infile, outfile+".transcode.mkv")
+	args, err := createFfmpegCommand(preset, probeData, infile, outfile)
 	if err != nil {
+		if errors.Is(err, errSkip) {
+			return
+		}
 		fmt.Printf("Item %q error forming ffmpeg command: %v\n", infile, err)
 		return
 	}
 
-	fmt.Printf("Item %q command: %s\n", infile, strings.Join(args, " "))
+	zap.S().Infof("Item %q command: %s\n", infile, strings.Join(args, " "))
 
 	startTime := time.Now()
 	cmd := exec.Command(args[0], args[1:]...)
@@ -167,66 +278,7 @@ func transcodeMatch(preset, infile, outfile string) {
 	}
 }
 
-type logFileEntry struct {
-	InputPath  string   `json:"input"`
-	OutputPath string   `json:"output"`
-	StartTime  string   `json:"start_time"`
-	Duration   string   `json:"duration"`
-	Args       []string `json:"args"`
-	Error      string   `json:"error"`
-}
-
-func appendLog(filename string, entry logFileEntry) error {
-	lock := flock.New(filename + ".lock")
-	if err := lock.Lock(); err != nil {
-		return err
-	}
-	defer lock.Unlock()
-	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	if err := enc.Encode(entry); err != nil {
-		return err
-	}
-	return nil
-}
-
-type probeData struct {
-	Streams []struct {
-		CodecType string `json:"codec_type"`
-		Channels  int    `json:"channels"`
-		// HDR metadata fields
-		ColorSpace     string `json:"color_space"`
-		ColorTransfer  string `json:"color_transfer"`
-		ColorPrimaries string `json:"color_primaries"`
-		// Size
-		Width  int `json:"width"`
-		Height int `json:"height"`
-	} `json:"streams"`
-}
-
-func createFfmpegCommand(preset string, videoFileName string, outputFileName string) ([]string, error) {
-	// Get file metadata using ffprobe
-	probeCmd := exec.Command("ffprobe",
-		"-v", "quiet",
-		"-print_format", "json",
-		"-show_format",
-		"-show_streams",
-		videoFileName,
-	)
-	probeOutput, err := probeCmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("ffprobe failed: %w", err)
-	}
-
-	var probeData probeData
-	if err := json.Unmarshal(probeOutput, &probeData); err != nil {
-		return nil, fmt.Errorf("failed to parse ffprobe output: %w", err)
-	}
-
+func createFfmpegCommand(preset string, probeData probeData, videoFileName string, outputFileName string) ([]string, error) {
 	args := []string{
 		"ffmpeg",
 	}
@@ -244,7 +296,7 @@ func createFfmpegCommand(preset string, videoFileName string, outputFileName str
 		newOutputFileName := "/output" + filepath.Ext(outputFileName)
 
 		args = append([]string{
-			"docker", "run", "--rm",
+			"docker", "run", "--rm", "--privileged",
 			"-v", videoFileName + ":" + newVideoFileName,
 			"-v", outputFileName + ":" + newOutputFileName,
 			*dockerImage,
@@ -271,33 +323,33 @@ func createFfmpegCommand(preset string, videoFileName string, outputFileName str
 	case "svtav1":
 		// SVT-AV1 presets documented here: https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/CommonQuestions.md#what-presets-do
 		// Good graphs for choosing presets: https://ottverse.com/analysis-of-svt-av1-presets-and-crf-values/
-		args = append(args, "-c:v", "libsvtav1", "-crf", "22", "-preset", "6")
+		args = append(args, "-c:v", "libsvtav1", "-crf", "24", "-preset", "6")
 	case "svtav1_fast":
 		// This encoder uses preset=8 which is ffmpeg's default preset. It produces decent results at crf=24
 		// and is very fast to encode as it's intended for streaming use cases.
 		// When time is of less concern, however, presets 4-6 e.g. in the default "svtav1" profile are preferred.
 		// SVT-AV1 presets documented here: https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/CommonQuestions.md#what-presets-do
-		args = append(args, "-c:v", "libsvtav1", "-crf", "22", "-preset", "8")
+		args = append(args, "-c:v", "libsvtav1", "-crf", "24", "-preset", "8")
 	default:
 		panic("unknown preset: " + preset)
 	}
 
-	targetRate1080p := 2000 // 2 MBps 1080p SVTAV1
+	targetRateKbps1080p := 2000 // 2 MBps 1080p SVTAV1
 	videoWidth, videoHeight := getResolution(probeData)
 	resolutionRatio := float64(videoWidth*videoHeight) / float64(1920*1080)
 	fmt.Printf("Resolution ratio: %f\n", resolutionRatio)
 	if resolutionRatio < 0.5 {
 		resolutionRatio = 0.5
 	}
+	targetMinRate := int(float64(targetRateKbps1080p) * resolutionRatio)
 
-	targetMinRate := int(float64(targetRate1080p) * resolutionRatio)
 	args = append(args,
 		"-minrate", fmt.Sprintf("%dk", targetMinRate),
 		"-bufsize", fmt.Sprintf("%dk", targetMinRate),
 	)
 
 	// Handle HDR settings
-	if isHDR(probeData) {
+	if probeData.HasHDR() {
 		switch preset {
 		case "h265":
 			args = append(args,
@@ -320,48 +372,22 @@ func createFfmpegCommand(preset string, videoFileName string, outputFileName str
 		args = append(args, "-pix_fmt", "yuv420p10le")
 	}
 
-	// TODO: properly handle surround audio
-	for _, stream := range probeData.Streams {
-		if stream.CodecType == "audio" {
-			if stream.Channels > 2 {
-				if *surroundSound {
-					// Keep original audio format for all audio streams
-					args = append(args,
-						"-c:a", "copy",
-					)
-				} else {
-					// Downmix to stereo for all audio streams
-					args = append(args,
-						"-c:a", "libopus",
-						"-ac", "2",
-						"-b:a", "128k",
-					)
-				}
-			} else {
-				// Convert all audio streams to opus
-				args = append(args,
-					"-c:a", "libopus",
-					"-b:a", "128k",
-				)
-			}
-			break
-		}
+	if probeData.HasSurroundAudio() && *surroundSound {
+		// Keep original audio format for all audio streams
+		args = append(args,
+			"-c:a", "copy",
+		)
+	} else {
+		// Downmix to stereo for all audio streams
+		args = append(args,
+			"-c:a", "libopus",
+			"-ac", "2",
+			"-b:a", "128k",
+		)
 	}
 
 	args = append(args, "-y", outputFileName)
 	return args, nil
-}
-
-func isHDR(probeData probeData) bool {
-	for _, stream := range probeData.Streams {
-		if stream.CodecType == "video" {
-			if stream.ColorSpace == "bt2020nc" && (stream.ColorTransfer == "arib-std-b67" || stream.ColorTransfer == "smpte2084") {
-				fmt.Println("Detected HDR content")
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func getResolution(probeData probeData) (int, int) {
