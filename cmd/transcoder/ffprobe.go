@@ -11,6 +11,7 @@ import (
 
 type streamData struct {
 	CodecType string `json:"codec_type"`
+	CodecName string `json:"codec_name"`
 	Channels  int    `json:"channels"`
 	// HDR metadata fields
 	ColorSpace     string `json:"color_space"`
@@ -19,6 +20,27 @@ type streamData struct {
 	// Size
 	Width  int `json:"width"`
 	Height int `json:"height"`
+
+	// Tags
+	Tags struct {
+		Language string `json:"language"`
+	} `json:"tags"`
+}
+
+func (sd *streamData) IsVideo() bool {
+	return sd.CodecType == "video"
+}
+
+func (sd *streamData) IsAudio() bool {
+	return sd.CodecType == "audio"
+}
+
+func (sd *streamData) IsSubtitle() bool {
+	return sd.CodecType == "subtitle"
+}
+
+func (sd *streamData) IsSurroundAudio() bool {
+	return sd.CodecType == "audio" && sd.Channels > 2
 }
 
 type probeData struct {
@@ -75,13 +97,13 @@ func (pd *probeData) HasSurroundAudio() bool {
 	return false
 }
 
-func (pd *probeData) GetVideoStream() *streamData {
+func (pd *probeData) GetVideoStream() streamData {
 	for _, stream := range pd.Streams {
 		if stream.CodecType == "video" {
-			return &stream
+			return stream
 		}
 	}
-	return nil
+	return streamData{}
 }
 
 func (pd *probeData) HasSubtitles() bool {
@@ -100,4 +122,15 @@ func (pd *probeData) GetBitrateBPS() int {
 		return 0
 	}
 	return bitrate
+}
+
+func (pd *probeData) MapStreamIdx(codecType string, rawStreamIdx int) int {
+	idx := 0
+	for i := 0; i < len(pd.Streams) && i < rawStreamIdx; i++ {
+		if pd.Streams[i].CodecType != codecType {
+			continue
+		}
+		idx++
+	}
+	return idx
 }

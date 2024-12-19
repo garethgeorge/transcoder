@@ -41,34 +41,33 @@ var (
 	}
 	logMu sync.Mutex
 
-	presets = []string{"h265", "h264", "h264_low", "svtav1", "svtav1_fast"}
+	// files with these suffixes are already encoded and are ignored
+	encoderSuffixes []string = []string{
+		"svtav1enc.mkv",
+		"svtav1enc.mp4",
+		".transcode.mkv",  // in-progress file
+		".transcode.mp4",  // in-progress file
+		".transcode.webm", // in-progress file
+	}
+)
+
+const (
+	bitrateTarget       = 2000000 // target bitrate if re-encoding is 2 Mbps AV1 at 1080p
+	lowBitrateThreshold = 3000000 // don't encode anything that's already below this at 1080p
 )
 
 func main() {
 	flag.Parse()
-	if flag.NArg() < 3 {
-		fmt.Printf("Usage: %s <preset> <input directory> <out directory>\n", os.Args[0])
-		fmt.Printf("Valid presets:\n")
-		for _, preset := range presets {
-			fmt.Printf("  %s\n", preset)
-		}
-		return
-	}
-
-	if !slices.Contains(presets, flag.Arg(0)) {
-		fmt.Printf("Invalid preset %q\n", flag.Arg(0))
+	if flag.NArg() < 1 {
+		fmt.Printf("Usage: %s <input directory>\n", os.Args[0])
 		return
 	}
 
 	fmt.Printf("Using docker image %q\n", *dockerImage)
-	fmt.Printf("Using preset %q\n", flag.Arg(0))
 
-	preset := flag.Arg(0)
-	inDir := flag.Arg(1)
-	outDir := flag.Arg(2)
+	inDir := flag.Arg(0)
 
 	zap.S().Infof("Input directory: %s\n", inDir)
-	zap.S().Infof("Output directory: %s\n", outDir)
 
 	if *logFile == "" {
 		*logFile = filepath.Join(os.Getenv("HOME"), ".local", "share", "gtranscoder", "transcode.log")
@@ -123,21 +122,21 @@ func main() {
 	}()
 
 	for _, match := range matches {
-		relativePath := strings.TrimPrefix(match, inDir)
-		outfile := filepath.Join(outDir, relativePath)
-		outfile = strings.TrimSuffix(outfile, filepath.Ext(outfile)) + ".mkv"
-
 		// resolve absolute paths
 		match, err := filepath.Abs(match)
 		if err != nil {
 			fmt.Printf("Error resolving absolute path: %v\n", err)
 			return
 		}
-		outfile, err = filepath.Abs(outfile)
-		if err != nil {
-			fmt.Printf("Error resolving absolute path: %v\n", err)
-			return
+
+		// skip files that are already encoded
+		if isEncodedFile(match) {
+			zap.S().Infof("Item %q is already encoded, skipping\n", match)
+			continue
 		}
+
+		outfile := deriveFilename(match)
+		zap.S().Infof("Item %q", match)
 
 		// skip previously transcoded files
 		found, ok := transcodeLogDict[tlogDictKey{
@@ -167,13 +166,13 @@ func main() {
 			zap.S().Errorf("Item %q ffprobe error: %v\n", match, err)
 			continue
 		}
-		if ffprobeData.GetBitrateBPS() < 2000000 {
+		if ffprobeData.GetBitrateBPS() < lowBitrateThreshold {
 			zap.S().Infof("Item %q is already low bitrate (%d bps), skipping\n", match, ffprobeData.GetBitrateBPS())
 			continue
 		}
 
 		zap.S().Infof("Item %q is high bitrate (%d bps), encoding it to AV1\n", match, ffprobeData.GetBitrateBPS())
-		transcodeMatch(preset, ffprobeData, match, outfile)
+		transcodeMatch(ffprobeData, match, outfile)
 	}
 
 	zap.S().Infof("All items processed")
@@ -187,24 +186,25 @@ func init() {
 	zap.ReplaceGlobals(consoleLogger)
 }
 
-func transcodeMatch(preset string, probeData probeData, infile, outfile string) {
-	fmt.Printf("Checking item %q -> %q\n", infile, outfile)
+func deriveFilename(inFile string) string {
+	ext := filepath.Ext(inFile)
+	inFile = strings.TrimSuffix(inFile, ext)
+	return fmt.Sprintf("%s - svtav1enc.mkv", inFile)
+}
 
-	// Check the whole transcode log ... this is a bit expensive but should be absolutely dwarfed by encoding times.
-	entries, err := readLog(*logFile)
-	if err != nil {
-		zap.S().Warnf("Error reading log: %v", err)
-	}
-	for _, entry := range entries {
-		if entry.InputPath == infile && entry.OutputPath == outfile {
-			fmt.Printf("Item %q already transcoded\n", infile)
-			return
+func isEncodedFile(filename string) bool {
+	for _, suffix := range encoderSuffixes {
+		if strings.HasSuffix(filename, suffix) {
+			return true
 		}
 	}
+	return false
+}
 
+func transcodeMatch(probeData probeData, infile, outfile string) {
 	// Check if the output file already exists
 	if _, err := os.Stat(outfile); err == nil {
-		fmt.Printf("Item %q already transcoded\n", infile)
+		zap.S().Warnf("Outfile for item %q already exists, skipping\n", infile)
 		return
 	}
 
@@ -229,7 +229,7 @@ func transcodeMatch(preset string, probeData probeData, infile, outfile string) 
 		return
 	}
 
-	args, err := createFfmpegCommand(preset, probeData, infile, outfile)
+	args, err := createFfmpegCommand(probeData, infile, outfile+".transcode.mkv")
 	if err != nil {
 		if errors.Is(err, errSkip) {
 			return
@@ -278,7 +278,7 @@ func transcodeMatch(preset string, probeData probeData, infile, outfile string) 
 	}
 }
 
-func createFfmpegCommand(preset string, probeData probeData, videoFileName string, outputFileName string) ([]string, error) {
+func createFfmpegCommand(probeData probeData, videoFileName string, outputFileName string) ([]string, error) {
 	args := []string{
 		"ffmpeg",
 	}
@@ -308,101 +308,87 @@ func createFfmpegCommand(preset string, probeData probeData, videoFileName strin
 
 	args = append(args,
 		"-i", videoFileName,
-		"-map", "0:v:0", // Map first video stream
-		"-map", "0:a", // Map all audio streams
-		"-c:s", "copy", // Copy all subtitle streams
 	)
 
-	switch preset {
-	case "h265":
-		args = append(args, "-c:v", "libx265", "-crf", "28", "-preset", "fast")
-	case "h264":
-		args = append(args, "-c:v", "libx264", "-crf", "24", "-preset", "fast")
-	case "h264_low":
-		args = append(args, "-c:v", "libx264", "-crf", "28", "-preset", "fast")
-	case "svtav1":
-		// SVT-AV1 presets documented here: https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/CommonQuestions.md#what-presets-do
-		// Good graphs for choosing presets: https://ottverse.com/analysis-of-svt-av1-presets-and-crf-values/
-		args = append(args, "-c:v", "libsvtav1", "-crf", "24", "-preset", "6")
-	case "svtav1_fast":
-		// This encoder uses preset=8 which is ffmpeg's default preset. It produces decent results at crf=24
-		// and is very fast to encode as it's intended for streaming use cases.
-		// When time is of less concern, however, presets 4-6 e.g. in the default "svtav1" profile are preferred.
-		// SVT-AV1 presets documented here: https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/CommonQuestions.md#what-presets-do
-		args = append(args, "-c:v", "libsvtav1", "-crf", "24", "-preset", "8")
-	default:
-		panic("unknown preset: " + preset)
+	// Step 0: map subtitles if found
+	if probeData.HasSubtitles() {
+		args = append(args, "-map", "0:s")
 	}
 
-	targetRateKbps1080p := 2000 // 2 MBps 1080p SVTAV1
-	videoWidth, videoHeight := getResolution(probeData)
-	resolutionRatio := float64(videoWidth*videoHeight) / float64(1920*1080)
-	fmt.Printf("Resolution ratio: %f\n", resolutionRatio)
-	if resolutionRatio < 0.5 {
-		resolutionRatio = 0.5
+	// Step 1: map and convert audio as needed, only maps audio if the language looks like it should be english.
+	outAudioIdx := 0
+	for idx, stream := range probeData.Streams {
+		if !stream.IsAudio() {
+			continue
+		}
+
+		langLower := strings.ToLower(stream.Tags.Language)
+		shouldInclude := langLower == "" || strings.Contains(langLower, "und") || strings.Contains(langLower, "en")
+		if !shouldInclude {
+			continue
+		}
+
+		audioIdx := probeData.MapStreamIdx("audio", idx)
+		args = append(args, "-map", fmt.Sprintf("0:a:%d", audioIdx))
+		if stream.IsSurroundAudio() {
+			args = append(args, fmt.Sprintf("-c:a:%d", outAudioIdx), "copy") // copy any surround audio channel
+		} else {
+			args = append(args, fmt.Sprintf("-c:a:%d", outAudioIdx), "libopus", "-b:a", "192k", "-ac", "2")
+		}
+		outAudioIdx++
 	}
-	targetMinRate := int(float64(targetRateKbps1080p) * resolutionRatio)
+	if outAudioIdx == 0 {
+		// No audio stream, just copy. Probably means the matchers didn't work.
+		args = append(args, "-c:a", "copy")
+	}
+
+	// Step 2: copy all subtitles
+	if probeData.HasSubtitles() {
+		args = append(args, "-map", "0:s")
+		args = append(args, "-c:s", "copy")
+	}
+
+	// Step 3: encode video
+	// map the video stream
+	videoStream := probeData.GetVideoStream()
+	if videoStream == (streamData{}) {
+		return nil, fmt.Errorf("no video stream")
+	}
+
+	targetMinRateBPS := scaleBitrateToResolution(bitrateTarget, videoStream.Width, videoStream.Height)
+	zap.S().Debugf("Target min bitrate scaled for resolution %dx%d: %d", videoStream.Width, videoStream.Height, targetMinRateBPS)
 
 	args = append(args,
-		"-minrate", fmt.Sprintf("%dk", targetMinRate),
-		"-bufsize", fmt.Sprintf("%dk", targetMinRate),
+		"-map", "0:v", "-c:v", "libsvtav1", "-crf", "24", "-preset", "8",
+		"-minrate", fmt.Sprintf("%dk", targetMinRateBPS/1000),
+		"-bufsize", fmt.Sprintf("%dk", targetMinRateBPS/1000),
 	)
 
 	// Handle HDR settings
 	if probeData.HasHDR() {
-		switch preset {
-		case "h265":
-			args = append(args,
-				"-colorspace", "bt2020nc",
-				"-color_primaries", "bt2020",
-				"-color_trc", "smpte2084",
-				"-x265-params", "hdr-opt=1:repeat-headers=1",
-			)
-		case "h264", "h264_low", "svtav1", "svtav1_fast":
-			args = append(args,
-				"-colorspace", "bt2020nc",
-				"-color_primaries", "bt2020",
-				"-color_trc", "smpte2084",
-			)
-		default:
-			panic("unknown preset: " + preset)
-		}
+		args = append(args,
+			"-colorspace", "bt2020nc",
+			"-color_primaries", "bt2020",
+			"-color_trc", "smpte2084",
+			"-strict", "experimental",
+		)
 	} else {
-		// Let's convert to a 10 bit color space, compatible with all encoders
+		// Let's always encode in 10 bit color
 		args = append(args, "-pix_fmt", "yuv420p10le")
 	}
 
-	if probeData.HasSurroundAudio() && *surroundSound {
-		// Keep original audio format for all audio streams
-		args = append(args,
-			"-c:a", "copy",
-		)
-	} else {
-		// Downmix to stereo for all audio streams
-		args = append(args,
-			"-c:a", "libopus",
-			"-ac", "2",
-			"-b:a", "128k",
-		)
-	}
+	args = append(args, "-y", outputFileName) // allow overwriting output
 
-	args = append(args, "-y", outputFileName)
 	return args, nil
 }
 
-func getResolution(probeData probeData) (int, int) {
-	videoIdx := videoStreamIndex(probeData)
-	if videoIdx == -1 {
-		return 0, 0
+func scaleBitrateToResolution(bitrate int, videoWidth int, videoHeight int) int {
+	ratio := float64(videoWidth*videoHeight) / float64(1920*1080)
+	if ratio < 0.5 {
+		ratio = 0.5
 	}
-	return probeData.Streams[videoIdx].Width, probeData.Streams[videoIdx].Height
-}
-
-func videoStreamIndex(probeData probeData) int {
-	for i, stream := range probeData.Streams {
-		if stream.CodecType == "video" {
-			return i
-		}
+	if ratio > 4 {
+		ratio = 4
 	}
-	return -1
+	return int(float64(bitrate) * ratio)
 }
