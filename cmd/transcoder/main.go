@@ -344,7 +344,6 @@ func createFfmpegCommand(probeData probeData, videoFileName string, outputFileNa
 
 	// Step 2: copy all subtitles
 	if probeData.HasSubtitles() {
-		args = append(args, "-map", "0:s")
 		args = append(args, "-c:s", "copy")
 	}
 
