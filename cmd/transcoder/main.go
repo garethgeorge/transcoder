@@ -7,11 +7,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/garethgeorge/media-toolkit/internal/encodelog"
+	"github.com/garethgeorge/media-toolkit/internal/ffmpegutil"
+	"github.com/garethgeorge/media-toolkit/internal/flags"
+	"github.com/garethgeorge/media-toolkit/internal/fsutil"
+	"github.com/garethgeorge/media-toolkit/internal/lockutil"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -21,39 +25,21 @@ var (
 )
 
 var (
-	logFile       = flag.String("log", "", "Log file, defaults to ~/.local/share/gtranscoder/transcode.log")
 	surroundSound = flag.Bool("surround", false, "Use surround sound if possible")
 	dockerImage   = flag.String("docker-image", "", "Docker image to use for ffmpeg")
 
-	videoFileExts []string = []string{
-		".mp4",
-		".mkv",
-		".avi",
-		".flv",
-		".webm",
-		".mov",
-		".wmv",
-		".mpg",
-		".mpeg",
-		".m4v",
-		".3gp",
-		".3g2",
-	}
 	logMu sync.Mutex
 
 	// files with these suffixes are already encoded and are ignored
 	encoderSuffixes []string = []string{
 		"svtav1enc.mkv",
 		"svtav1enc.mp4",
-		".transcode.mkv",  // in-progress file
-		".transcode.mp4",  // in-progress file
-		".transcode.webm", // in-progress file
 	}
 )
 
 const (
-	bitrateTarget       = 2000000 // target bitrate if re-encoding is 2 Mbps AV1 at 1080p
-	lowBitrateThreshold = 3000000 // don't encode anything that's already below this at 1080p
+	bitrateTarget       = 3000000 // target bitrate if re-encoding is 2 Mbps AV1 at 1080p
+	lowBitrateThreshold = 4000000 // don't encode anything that's already below this at 1080p
 )
 
 func main() {
@@ -69,46 +55,34 @@ func main() {
 
 	zap.S().Infof("Input directory: %s\n", inDir)
 
-	if *logFile == "" {
-		*logFile = filepath.Join(os.Getenv("HOME"), ".local", "share", "gtranscoder", "transcode.log")
-	}
-	if err := os.MkdirAll(filepath.Dir(*logFile), 0755); err != nil {
+	logFile := flags.LogFilePath()
+
+	if err := os.MkdirAll(filepath.Dir(logFile), 0755); err != nil {
 		zap.S().Fatalf("Error creating log directory: %v", err)
 	}
 
-	var matches []string
-	filepath.Walk(inDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			fmt.Printf("Error walking path %q: %v\n", path, err)
-			return nil
-		}
-		if info.IsDir() || !slices.Contains(videoFileExts, filepath.Ext(path)) {
-			return nil
-		}
-		matches = append(matches, path)
-		return nil
-	})
-
-	slices.Sort(matches)
+	matches, err := fsutil.MediaInDir(inDir)
+	if err != nil {
+		zap.S().Fatalf("Error listing input directory: %v", err)
+	}
 
 	zap.S().Infof("Found %d video files\n", len(matches))
 
 	// refresh the transcode log every minute from disk. This should do a reasonably good job of catching new entries.
-	var transcodeLogMu sync.Mutex
 	type tlogDictKey struct {
 		InputPath  string
 		OutputPath string
 	}
-	transcodeLogDict := make(map[tlogDictKey]logFileEntry)
+	lastTranscodeLogUpdate := time.Now()
+	transcodeLogDict := make(map[tlogDictKey]encodelog.LogFileEntry)
 
-	go func() {
-		for {
-			time.Sleep(300 * time.Second)
-			transcodeLogMu.Lock()
-			updated, err := readLog(*logFile)
+	refreshTranscodeLog := func() {
+		if time.Since(lastTranscodeLogUpdate) > 60*time.Second {
+			zap.S().Infof("Refreshing transcode log")
+			updated, err := encodelog.ReadLog(logFile)
 			if err != nil {
 				zap.S().Warnf("Error reading transcode log: %v", err)
-				continue
+				return
 			}
 			for _, entry := range updated {
 				key := tlogDictKey{
@@ -117,9 +91,9 @@ func main() {
 				}
 				transcodeLogDict[key] = entry
 			}
-			transcodeLogMu.Unlock()
+			lastTranscodeLogUpdate = time.Now()
 		}
-	}()
+	}
 
 	for _, match := range matches {
 		// resolve absolute paths
@@ -139,6 +113,7 @@ func main() {
 		zap.S().Infof("Item %q", match)
 
 		// skip previously transcoded files
+		refreshTranscodeLog()
 		found, ok := transcodeLogDict[tlogDictKey{
 			InputPath:  match,
 			OutputPath: outfile,
@@ -161,7 +136,7 @@ func main() {
 		}
 
 		// examine whether we should encode the file or not
-		ffprobeData, err := getFfprobeInfo(match)
+		ffprobeData, err := ffmpegutil.GetFfprobeInfo(match)
 		if err != nil {
 			zap.S().Errorf("Item %q ffprobe error: %v\n", match, err)
 			continue
@@ -189,7 +164,7 @@ func init() {
 func deriveFilename(inFile string) string {
 	ext := filepath.Ext(inFile)
 	inFile = strings.TrimSuffix(inFile, ext)
-	return fmt.Sprintf("%s - svtav1enc.mkv", inFile)
+	return fmt.Sprintf("%s-svtav1enc.mkv", inFile)
 }
 
 func isEncodedFile(filename string) bool {
@@ -201,16 +176,16 @@ func isEncodedFile(filename string) bool {
 	return false
 }
 
-func transcodeMatch(probeData probeData, infile, outfile string) {
+func transcodeMatch(probeData ffmpegutil.ProbeData, infile, outfile string) {
 	// Check if the output file already exists
 	if _, err := os.Stat(outfile); err == nil {
 		zap.S().Warnf("Outfile for item %q already exists, skipping\n", infile)
 		return
 	}
 
-	namedLockSet := &NamedLockSet{File: os.TempDir() + "/gtranscoder.lockset"}
+	namedLockSet := &lockutil.NamedLockSet{File: os.TempDir() + "/gtranscoder.lockset"}
 	if err := namedLockSet.TryAcquire(infile); err != nil {
-		if errors.Is(err, ErrLockAlreadyHeld) {
+		if errors.Is(err, lockutil.ErrLockAlreadyHeld) {
 			fmt.Printf("Item %q already transcoding by another proces: %v\n", infile, err)
 			return
 		}
@@ -245,7 +220,7 @@ func transcodeMatch(probeData probeData, infile, outfile string) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	baseLog := logFileEntry{
+	baseLog := encodelog.LogFileEntry{
 		InputPath:  infile,
 		OutputPath: outfile,
 		StartTime:  time.Now().Format(time.RFC3339),
@@ -257,7 +232,7 @@ func transcodeMatch(probeData probeData, infile, outfile string) {
 		fmt.Printf("Item %q error: %v\n", infile, err)
 		baseLog.Error = err.Error()
 		baseLog.Duration = time.Since(startTime).String()
-		if err := appendLog(*logFile, baseLog); err != nil {
+		if err := encodelog.AppendLog(flags.LogFilePath(), baseLog); err != nil {
 			fmt.Printf("Log write error %q: %v\n", infile, err)
 		}
 
@@ -268,7 +243,7 @@ func transcodeMatch(probeData probeData, infile, outfile string) {
 	} else {
 		fmt.Printf("Item %q transcoded\n", infile)
 		baseLog.Duration = time.Since(startTime).String()
-		if err := appendLog(*logFile, baseLog); err != nil {
+		if err := encodelog.AppendLog(flags.LogFilePath(), baseLog); err != nil {
 			fmt.Printf("Log write error %q: %v\n", infile, err)
 		}
 	}
@@ -278,8 +253,9 @@ func transcodeMatch(probeData probeData, infile, outfile string) {
 	}
 }
 
-func createFfmpegCommand(probeData probeData, videoFileName string, outputFileName string) ([]string, error) {
+func createFfmpegCommand(probeData ffmpegutil.ProbeData, videoFileName string, outputFileName string) ([]string, error) {
 	args := []string{
+		"nice", "-n", "19",
 		"ffmpeg",
 	}
 
@@ -350,7 +326,7 @@ func createFfmpegCommand(probeData probeData, videoFileName string, outputFileNa
 	// Step 3: encode video
 	// map the video stream
 	videoStream := probeData.GetVideoStream()
-	if videoStream == (streamData{}) {
+	if videoStream == (ffmpegutil.StreamData{}) {
 		return nil, fmt.Errorf("no video stream")
 	}
 
@@ -358,7 +334,7 @@ func createFfmpegCommand(probeData probeData, videoFileName string, outputFileNa
 	zap.S().Debugf("Target min bitrate scaled for resolution %dx%d: %d", videoStream.Width, videoStream.Height, targetMinRateBPS)
 
 	args = append(args,
-		"-map", "0:v", "-c:v", "libsvtav1", "-crf", "24", "-preset", "8",
+		"-map", "0:v", "-c:v", "libsvtav1", "-crf", "20", "-preset", "8",
 		"-minrate", fmt.Sprintf("%dk", targetMinRateBPS/1000),
 		"-bufsize", fmt.Sprintf("%dk", targetMinRateBPS/1000),
 	)

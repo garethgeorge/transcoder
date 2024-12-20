@@ -1,4 +1,4 @@
-package main
+package ffmpegutil
 
 import (
 	"encoding/json"
@@ -9,7 +9,7 @@ import (
 	"go.uber.org/zap"
 )
 
-type streamData struct {
+type StreamData struct {
 	CodecType string `json:"codec_type"`
 	CodecName string `json:"codec_name"`
 	Channels  int    `json:"channels"`
@@ -27,33 +27,33 @@ type streamData struct {
 	} `json:"tags"`
 }
 
-func (sd *streamData) IsVideo() bool {
+func (sd *StreamData) IsVideo() bool {
 	return sd.CodecType == "video"
 }
 
-func (sd *streamData) IsAudio() bool {
+func (sd *StreamData) IsAudio() bool {
 	return sd.CodecType == "audio"
 }
 
-func (sd *streamData) IsSubtitle() bool {
+func (sd *StreamData) IsSubtitle() bool {
 	return sd.CodecType == "subtitle"
 }
 
-func (sd *streamData) IsSurroundAudio() bool {
+func (sd *StreamData) IsSurroundAudio() bool {
 	return sd.CodecType == "audio" && sd.Channels > 2
 }
 
-type probeData struct {
+type ProbeData struct {
 	videoFileName string `json:"-"`
 
 	Format struct {
 		BitRate string `json:"bit_rate"`
 	} `json:"format"`
 
-	Streams []streamData `json:"streams"`
+	Streams []StreamData `json:"streams"`
 }
 
-func getFfprobeInfo(videoFileName string) (probeData, error) {
+func GetFfprobeInfo(videoFileName string) (ProbeData, error) {
 	// Get file metadata using ffprobe
 	probeCmd := exec.Command("ffprobe",
 		"-v", "quiet",
@@ -64,12 +64,12 @@ func getFfprobeInfo(videoFileName string) (probeData, error) {
 	)
 	probeOutput, err := probeCmd.Output()
 	if err != nil {
-		return probeData{}, fmt.Errorf("ffprobe failed: %w", err)
+		return ProbeData{}, fmt.Errorf("ffprobe failed: %w", err)
 	}
 
-	var pd probeData
+	var pd ProbeData
 	if err := json.Unmarshal(probeOutput, &pd); err != nil {
-		return probeData{}, fmt.Errorf("failed to parse ffprobe output: %w", err)
+		return ProbeData{}, fmt.Errorf("failed to parse ffprobe output: %w", err)
 	}
 
 	pd.videoFileName = videoFileName
@@ -77,7 +77,7 @@ func getFfprobeInfo(videoFileName string) (probeData, error) {
 	return pd, nil
 }
 
-func (pd *probeData) HasHDR() bool {
+func (pd *ProbeData) HasHDR() bool {
 	for _, stream := range pd.Streams {
 		if stream.CodecType == "video" {
 			if stream.ColorSpace == "bt2020nc" && (stream.ColorTransfer == "arib-std-b67" || stream.ColorTransfer == "smpte2084") {
@@ -88,7 +88,7 @@ func (pd *probeData) HasHDR() bool {
 	return false
 }
 
-func (pd *probeData) HasSurroundAudio() bool {
+func (pd *ProbeData) HasSurroundAudio() bool {
 	for _, stream := range pd.Streams {
 		if stream.CodecType == "audio" && stream.Channels > 2 {
 			return true
@@ -97,16 +97,16 @@ func (pd *probeData) HasSurroundAudio() bool {
 	return false
 }
 
-func (pd *probeData) GetVideoStream() streamData {
+func (pd *ProbeData) GetVideoStream() StreamData {
 	for _, stream := range pd.Streams {
 		if stream.CodecType == "video" {
 			return stream
 		}
 	}
-	return streamData{}
+	return StreamData{}
 }
 
-func (pd *probeData) HasSubtitles() bool {
+func (pd *ProbeData) HasSubtitles() bool {
 	for _, stream := range pd.Streams {
 		if stream.CodecType == "subtitle" {
 			return true
@@ -115,7 +115,7 @@ func (pd *probeData) HasSubtitles() bool {
 	return false
 }
 
-func (pd *probeData) GetBitrateBPS() int {
+func (pd *ProbeData) GetBitrateBPS() int {
 	bitrate, err := strconv.Atoi(pd.Format.BitRate)
 	if err != nil {
 		zap.S().Warnf("failed to parse bitrate: %v", err)
@@ -124,7 +124,7 @@ func (pd *probeData) GetBitrateBPS() int {
 	return bitrate
 }
 
-func (pd *probeData) MapStreamIdx(codecType string, rawStreamIdx int) int {
+func (pd *ProbeData) MapStreamIdx(codecType string, rawStreamIdx int) int {
 	idx := 0
 	for i := 0; i < len(pd.Streams) && i < rawStreamIdx; i++ {
 		if pd.Streams[i].CodecType != codecType {

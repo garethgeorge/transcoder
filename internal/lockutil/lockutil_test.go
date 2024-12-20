@@ -1,4 +1,4 @@
-package main
+package lockutil
 
 import (
 	"errors"

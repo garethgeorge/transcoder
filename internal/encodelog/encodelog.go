@@ -1,4 +1,4 @@
-package main
+package encodelog
 
 import (
 	"bufio"
@@ -9,17 +9,17 @@ import (
 	"go.uber.org/zap"
 )
 
-type logFileEntry struct {
-	InputPath  string   `json:"input"`
-	OutputPath string   `json:"output"`
-	StartTime  string   `json:"start_time"`
-	Duration   string   `json:"duration"`
-	Args       []string `json:"args"`
-	Error      string   `json:"error"`
-	Skipped    string   `json:"skipped"` // a string reason for skipping.
+type LogFileEntry struct {
+	InputPath  string   `json:"input,omitempty"`
+	OutputPath string   `json:"output,omitempty"`
+	StartTime  string   `json:"start_time,omitempty"`
+	Duration   string   `json:"duration,omitempty"`
+	Args       []string `json:"args,omitempty"`
+	Error      string   `json:"error,omitempty"`
+	Skipped    string   `json:"skipped,omitempty"`
 }
 
-func appendLog(filename string, entry logFileEntry) error {
+func AppendLog(filename string, entry LogFileEntry) error {
 	lock := flock.New(filename + ".lock")
 	if err := lock.Lock(); err != nil {
 		return err
@@ -37,7 +37,7 @@ func appendLog(filename string, entry logFileEntry) error {
 	return nil
 }
 
-func readLog(filename string) ([]logFileEntry, error) {
+func ReadLog(filename string) ([]LogFileEntry, error) {
 	lock := flock.New(filename + ".lock")
 	if err := lock.RLock(); err != nil {
 		return nil, err
@@ -49,10 +49,10 @@ func readLog(filename string) ([]logFileEntry, error) {
 		return nil, err
 	}
 	// parse the file line by line as NDJSON
-	var entries []logFileEntry
+	var entries []LogFileEntry
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		var entry logFileEntry
+		var entry LogFileEntry
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
 			zap.S().Warnf("failed to parse transcode log entry: %v", err)
 			continue
