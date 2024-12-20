@@ -34,6 +34,7 @@ var (
 	encoderSuffixes []string = []string{
 		"svtav1enc.mkv",
 		"svtav1enc.mp4",
+		".transcode.mkv",
 	}
 )
 
@@ -73,7 +74,7 @@ func main() {
 		InputPath  string
 		OutputPath string
 	}
-	lastTranscodeLogUpdate := time.Now()
+	lastTranscodeLogUpdate := time.Time{}
 	transcodeLogDict := make(map[tlogDictKey]encodelog.LogFileEntry)
 
 	refreshTranscodeLog := func() {
@@ -91,6 +92,7 @@ func main() {
 				}
 				transcodeLogDict[key] = entry
 			}
+			zap.S().Infof("Refreshed transcode log, loaded %d entries", len(transcodeLogDict))
 			lastTranscodeLogUpdate = time.Now()
 		}
 	}
@@ -105,7 +107,6 @@ func main() {
 
 		// skip files that are already encoded
 		if isEncodedFile(match) {
-			zap.S().Infof("Item %q is already encoded, skipping\n", match)
 			continue
 		}
 
@@ -143,6 +144,11 @@ func main() {
 		}
 		if ffprobeData.GetBitrateBPS() < lowBitrateThreshold {
 			zap.S().Infof("Item %q is already low bitrate (%d bps), skipping\n", match, ffprobeData.GetBitrateBPS())
+			encodelog.AppendLog(logFile, encodelog.LogFileEntry{
+				InputPath:  match,
+				OutputPath: outfile,
+				Skipped:    fmt.Sprintf("already low bitrate (%d bps)", ffprobeData.GetBitrateBPS()),
+			})
 			continue
 		}
 
@@ -297,13 +303,6 @@ func createFfmpegCommand(probeData ffmpegutil.ProbeData, videoFileName string, o
 		if !stream.IsAudio() {
 			continue
 		}
-
-		langLower := strings.ToLower(stream.Tags.Language)
-		shouldInclude := langLower == "" || strings.Contains(langLower, "und") || strings.Contains(langLower, "en")
-		if !shouldInclude {
-			continue
-		}
-
 		audioIdx := probeData.MapStreamIdx("audio", idx)
 		args = append(args, "-map", fmt.Sprintf("0:a:%d", audioIdx))
 		if stream.IsSurroundAudio() {
@@ -312,10 +311,6 @@ func createFfmpegCommand(probeData ffmpegutil.ProbeData, videoFileName string, o
 			args = append(args, fmt.Sprintf("-c:a:%d", outAudioIdx), "libopus", "-b:a", "192k", "-ac", "2")
 		}
 		outAudioIdx++
-	}
-	if outAudioIdx == 0 {
-		// No audio stream, just copy. Probably means the matchers didn't work.
-		args = append(args, "-c:a", "copy")
 	}
 
 	// Step 2: copy all subtitles
@@ -334,7 +329,7 @@ func createFfmpegCommand(probeData ffmpegutil.ProbeData, videoFileName string, o
 	zap.S().Debugf("Target min bitrate scaled for resolution %dx%d: %d", videoStream.Width, videoStream.Height, targetMinRateBPS)
 
 	args = append(args,
-		"-map", "0:v", "-c:v", "libsvtav1", "-crf", "20", "-preset", "8",
+		"-map", "0:v", "-c:v", "libsvtav1", "-crf", "22", "-preset", "8",
 		"-minrate", fmt.Sprintf("%dk", targetMinRateBPS/1000),
 		"-bufsize", fmt.Sprintf("%dk", targetMinRateBPS/1000),
 	)
