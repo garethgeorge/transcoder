@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/garethgeorge/media-toolkit/internal/encodelog"
@@ -25,10 +24,10 @@ var (
 )
 
 var (
-	surroundSound = flag.Bool("surround", false, "Use surround sound if possible")
-	dockerImage   = flag.String("docker-image", "", "Docker image to use for ffmpeg")
+	dockerImage = flag.String("docker-image", "", "Docker image to use for ffmpeg")
+	dockerCpus  = flag.String("docker-cpus", "", "CPU set CPUs to use for encoding e.g. by index 0,1,2,3,....")
 
-	logMu sync.Mutex
+	preset = flag.Int("preset", 8, "Preset to use for encoding. Preset = 8 is fast and disables filmgrain detection / synthesis. Preset = 6 is good for movies and provides a good quality balance.")
 
 	// files with these suffixes are already encoded and are ignored
 	encoderSuffixes []string = []string{
@@ -277,12 +276,19 @@ func createFfmpegCommand(probeData ffmpegutil.ProbeData, videoFileName string, o
 		newVideoFileName := "/input" + filepath.Ext(videoFileName)
 		newOutputFileName := "/output" + filepath.Ext(outputFileName)
 
+		oldArgs := args
 		args = append([]string{
 			"docker", "run", "--rm", "--privileged",
 			"-v", videoFileName + ":" + newVideoFileName,
 			"-v", outputFileName + ":" + newOutputFileName,
+		})
+		if *dockerCpus != "" {
+			args = append(args, "--cpuset-cpus", fmt.Sprintf("%s", *dockerCpus))
+		}
+		args = append(args,
 			*dockerImage,
-		}, args...)
+		)
+		args = append(args, oldArgs...)
 
 		videoFileName = newVideoFileName
 		outputFileName = newOutputFileName
@@ -292,12 +298,45 @@ func createFfmpegCommand(probeData ffmpegutil.ProbeData, videoFileName string, o
 		"-i", videoFileName,
 	)
 
-	// Step 0: map subtitles if found
-	if probeData.HasSubtitles() {
-		args = append(args, "-map", "0:s")
+	// Step 1: encode video
+	// map the video stream
+	videoStream := probeData.GetVideoStream()
+	if videoStream == (ffmpegutil.StreamData{}) {
+		return nil, fmt.Errorf("no video stream")
 	}
 
-	// Step 1: map and convert audio as needed, only maps audio if the language looks like it should be english.
+	targetMinRateBPS := scaleBitrateToResolution(bitrateTarget, videoStream.Width, videoStream.Height)
+	zap.S().Debugf("Target min bitrate scaled for resolution %dx%d: %d", videoStream.Width, videoStream.Height, targetMinRateBPS)
+
+	// Documentation on SVTAV1 params https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/Ffmpeg.md#example-2-encoding-for-personal-use
+	args = append(args,
+		"-map", "0:v", "-c:v", "libsvtav1", "-crf", "24", "-preset", fmt.Sprintf("%d", *preset),
+	)
+
+	if *preset <= 6 {
+		args = append(args, "-svtav1-params", "tune=0:film-grain=8") // optimized for subjective visual quality and will detect and add / film grain.
+	} else {
+		args = append(args, "-svtav1-params", "tune=0:film-grain=0") // optimized for subjective visual quality and do nothing with film grain.
+	}
+
+	args = append(args,
+		"-minrate", fmt.Sprintf("%dk", targetMinRateBPS/1000),
+		"-bufsize", fmt.Sprintf("%dk", targetMinRateBPS/1000))
+
+	// Handle HDR settings
+	if probeData.HasHDR() {
+		args = append(args,
+			"-colorspace", "bt2020nc",
+			"-color_primaries", "bt2020",
+			"-color_trc", "smpte2084",
+			"-strict", "experimental",
+		)
+	} else {
+		// Let's always encode in 10 bit color
+		args = append(args, "-pix_fmt", "yuv420p10le")
+	}
+
+	// Step 2: map and convert audio as needed, only maps audio if the language looks like it should be english.
 	outAudioIdx := 0
 	for idx, stream := range probeData.Streams {
 		if !stream.IsAudio() {
@@ -313,38 +352,9 @@ func createFfmpegCommand(probeData ffmpegutil.ProbeData, videoFileName string, o
 		outAudioIdx++
 	}
 
-	// Step 2: copy all subtitles
+	// Step 3: copy all subtitles
 	if probeData.HasSubtitles() {
 		args = append(args, "-c:s", "copy")
-	}
-
-	// Step 3: encode video
-	// map the video stream
-	videoStream := probeData.GetVideoStream()
-	if videoStream == (ffmpegutil.StreamData{}) {
-		return nil, fmt.Errorf("no video stream")
-	}
-
-	targetMinRateBPS := scaleBitrateToResolution(bitrateTarget, videoStream.Width, videoStream.Height)
-	zap.S().Debugf("Target min bitrate scaled for resolution %dx%d: %d", videoStream.Width, videoStream.Height, targetMinRateBPS)
-
-	args = append(args,
-		"-map", "0:v", "-c:v", "libsvtav1", "-crf", "22", "-preset", "8",
-		"-minrate", fmt.Sprintf("%dk", targetMinRateBPS/1000),
-		"-bufsize", fmt.Sprintf("%dk", targetMinRateBPS/1000),
-	)
-
-	// Handle HDR settings
-	if probeData.HasHDR() {
-		args = append(args,
-			"-colorspace", "bt2020nc",
-			"-color_primaries", "bt2020",
-			"-color_trc", "smpte2084",
-			"-strict", "experimental",
-		)
-	} else {
-		// Let's always encode in 10 bit color
-		args = append(args, "-pix_fmt", "yuv420p10le")
 	}
 
 	args = append(args, "-y", outputFileName) // allow overwriting output

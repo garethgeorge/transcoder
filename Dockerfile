@@ -55,6 +55,7 @@ RUN mkdir -p ~/ffmpeg_sources ~/bin && cd ~/ffmpeg_sources && \
   --enable-libx264 \
   --enable-libx265 \
   --enable-libsvtav1 \
+  --enable-static \
   --enable-nonfree && \
   PATH="$HOME/bin:$PATH" make -j24 && \
   make install -j24

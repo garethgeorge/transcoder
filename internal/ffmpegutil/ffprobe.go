@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"strings"
 
 	"go.uber.org/zap"
 )
@@ -33,6 +34,11 @@ func (sd *StreamData) IsVideo() bool {
 
 func (sd *StreamData) IsAudio() bool {
 	return sd.CodecType == "audio"
+}
+
+func (sd *StreamData) IsMaybeEnglishAudio() bool {
+	langLower := strings.ToLower(sd.Tags.Language)
+	return langLower == "" || strings.Contains(langLower, "und") || strings.Contains(langLower, "en")
 }
 
 func (sd *StreamData) IsSubtitle() bool {
