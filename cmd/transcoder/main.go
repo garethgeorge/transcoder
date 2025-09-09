@@ -27,7 +27,7 @@ var (
 	dockerImage = flag.String("docker-image", "", "Docker image to use for ffmpeg")
 	dockerCpus  = flag.String("docker-cpus", "", "CPU set CPUs to use for encoding e.g. by index 0,1,2,3,....")
 
-	preset = flag.Int("preset", 8, "Preset to use for encoding. Preset = 8 is fast and disables filmgrain detection / synthesis. Preset = 6 is good for movies and provides a good quality balance.")
+	preset = flag.Int("preset", 6, "Preset to use for encoding. Preset = 8 is fast and disables filmgrain detection / synthesis. Preset = 6 is good for movies and provides a good quality balance.")
 
 	// files with these suffixes are already encoded and are ignored
 	encoderSuffixes []string = []string{
@@ -38,8 +38,8 @@ var (
 )
 
 const (
-	bitrateTarget       = 3000000 // target bitrate if re-encoding is 2 Mbps AV1 at 1080p
-	lowBitrateThreshold = 4000000 // don't encode anything that's already below this at 1080p
+	bitrateTarget       = 4000000 // target bitrate if re-encoding is 2 Mbps AV1 at 1080p
+	lowBitrateThreshold = 5000000 // don't encode anything that's already below this at 1080p
 )
 
 func main() {
@@ -276,19 +276,18 @@ func createFfmpegCommand(probeData ffmpegutil.ProbeData, videoFileName string, o
 		newVideoFileName := "/input" + filepath.Ext(videoFileName)
 		newOutputFileName := "/output" + filepath.Ext(outputFileName)
 
-		oldArgs := args
-		args = append([]string{
+		dockerArgs := []string{
 			"docker", "run", "--rm", "--privileged",
 			"-v", videoFileName + ":" + newVideoFileName,
 			"-v", outputFileName + ":" + newOutputFileName,
-		})
-		if *dockerCpus != "" {
-			args = append(args, "--cpuset-cpus", fmt.Sprintf("%s", *dockerCpus))
 		}
-		args = append(args,
+		if *dockerCpus != "" {
+			dockerArgs = append(dockerArgs, "--cpuset-cpus", fmt.Sprintf("%s", *dockerCpus))
+		}
+		dockerArgs = append(dockerArgs,
 			*dockerImage,
 		)
-		args = append(args, oldArgs...)
+		args = append(dockerArgs, args...)
 
 		videoFileName = newVideoFileName
 		outputFileName = newOutputFileName
